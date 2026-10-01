@@ -15,7 +15,14 @@ export type AWS_JWK = {
 function handleVerificationError(e: Error) {
   if (
     e instanceof errors.JOSEError &&
-    ['ERR_JWT_CLAIM_INVALID', 'ERR_JWT_EXPIRED', 'ERR_JWT_MALFORMED'].includes(e.code)
+    [
+      'ERR_JWT_CLAIM_VALIDATION_FAILED',
+      'ERR_JWT_EXPIRED',
+      'ERR_JWT_INVALID',
+      'ERR_JWS_INVALID',
+      'ERR_JWS_SIGNATURE_VERIFICATION_FAILED',
+      'ERR_JOSE_ALG_NOT_ALLOWED',
+    ].includes(e.code)
   ) {
     throw new JwtVerificationError(e);
   }
@@ -42,11 +49,25 @@ function validateTokenUseClaim(payload: any, tokenType: 'id' | 'access') {
   }
 }
 
-const jwkCache: { [key: string]: JWK } = {};
+function validateClientIdClaim(payload: any, appClientId: string) {
+  if (payload.client_id !== appClientId) {
+    const originalError = new JwtCognitoClaimValidationError(
+      'client_id',
+      `expected "${appClientId}", got "${payload.client_id}"`,
+    );
+
+    throw new JwtVerificationError(originalError);
+  }
+}
+
+// keyed by issuer and kid so keys from one issuer can never be used for another
+const jwkCache = new Map<string, JWK>();
 
 export async function getJwkByKid(iss: string, kid: string) {
-  if (kid in jwkCache) {
-    return jwkCache[kid];
+  const cacheKey = `${iss}#${kid}`;
+  const cached = jwkCache.get(cacheKey);
+  if (cached) {
+    return cached;
   }
   const jwksEndpoint = iss + '/.well-known/jwks.json';
   const result = await fetch(jwksEndpoint, {
@@ -59,21 +80,26 @@ export async function getJwkByKid(iss: string, kid: string) {
       },
     },
   });
+  if (!result.ok) {
+    throw new Error(`Failed to fetch JWKS from ${jwksEndpoint}: ${result.status}`);
+  }
   const { keys } = (await result.json()) as {
-     keys: (JWK & AWS_JWK)[]
+    keys: (JWK & AWS_JWK)[];
   };
 
   for (const key of keys) {
-    jwkCache[key.kid] = key;
+    jwkCache.set(`${iss}#${key.kid}`, key);
   }
-  return jwkCache[kid];
+  const jwk = jwkCache.get(cacheKey);
+  if (!jwk) {
+    throw new JwksNoMatchingKeyError(new Error(`No key with kid "${kid}" in ${jwksEndpoint}`));
+  }
+  return jwk;
 }
 
 export function getJwt(str: string) {
-  if (!str || str.substring(0, 6) !== 'Bearer') {
-    return null;
-  }
-  return str.substring(6).trim();
+  const match = str && /^Bearer\s+(\S+)\s*$/i.exec(str);
+  return match ? match[1] : null;
 }
 
 export function getVerifier({
@@ -89,27 +115,39 @@ export function getVerifier({
 }) {
   if (!crypto || !crypto.subtle) throw new Error('Crypto not supported, are you deploying to Cloudflare Worker?');
 
+  // Never derive the issuer (and therefore the JWKS URL) from the unverified token.
+  const issuer = `https://cognito-idp.${awsRegion}.amazonaws.com/${userPoolId}`;
+
   return {
     verify: async (authHeader: string) => {
       const token = getJwt(authHeader);
       if (!token) throw new JwtInvalidError();
-      const { header, payload } = decode(token);
+      let header, payload;
+      try {
+        ({ header, payload } = decode(token));
+      } catch {
+        throw new JwtInvalidError();
+      }
       const { kid } = header;
 
       if (!payload.iss || !kid) throw new JwtInvalidError();
+      if (payload.iss !== issuer) {
+        throw new JwtVerificationError(
+          new JwtCognitoClaimValidationError('iss', `expected "${issuer}", got "${payload.iss}"`),
+        );
+      }
 
-      const jwk = await getJwkByKid(payload.iss, kid);
+      const jwk = await getJwkByKid(issuer, kid);
 
       try {
-        const joseOptions = {
-          profile: tokenType === 'id' ? 'id_token' : undefined,
+        const key = await importJWK(jwk, 'RS256');
+        const result = await jwtVerify(token, key, {
+          algorithms: ['RS256'],
           audience: tokenType === 'id' ? appClientId : undefined,
-          issuer: `https://cognito-idp.${awsRegion}.amazonaws.com/${userPoolId}`,
-        };
-
-        const key = await importJWK(jwk);
-        const result = await jwtVerify(token, key, joseOptions);
-        validateTokenUseClaim(payload, tokenType);
+          issuer,
+        });
+        validateTokenUseClaim(result.payload, tokenType);
+        if (tokenType === 'access') validateClientIdClaim(result.payload, appClientId);
 
         return result;
       } catch (e) {
@@ -120,8 +158,13 @@ export function getVerifier({
 }
 
 export function isJwtError(e: Error) {
-  if (e instanceof JwksNoMatchingKeyError || e instanceof JwtVerificationError || e instanceof JwtInvalidError || e instanceof JwtCognitoClaimValidationError) {
-    return true
+  if (
+    e instanceof JwksNoMatchingKeyError ||
+    e instanceof JwtVerificationError ||
+    e instanceof JwtInvalidError ||
+    e instanceof JwtCognitoClaimValidationError
+  ) {
+    return true;
   }
   return false;
 }
